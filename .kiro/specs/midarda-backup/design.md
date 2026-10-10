@@ -332,7 +332,7 @@ sequenceDiagram
     T-->>T: update state/log/metrics
 ```
 
-Порядок строгий: MSSQL → local checksum sidecar → для каждого destination backup → sidecar → optional SMB read-back → destination rotation → local rotation. MSSQL failure запрещает hash/copy/rotation. Ошибка одного destination записывается и не прерывает другой. Ротация destination запускается только после успешной публикации обоих объектов этого destination; локальная — после завершения обеих destination branches, даже если одна была недоступна.
+Порядок строгий: MSSQL → local checksum sidecar → для каждого destination backup → sidecar → optional SMB read-back → destination rotation → local rotation. MSSQL failure запрещает hash/copy/rotation. Если ни одно назначение не включено (и SMB, и FTP отключены), транзакция получает статус failed согласно С-11.17. Ошибка одного destination записывается и не прерывает другой. Ротация destination запускается только после успешной публикации обоих объектов этого destination; локальная — после завершения обеих destination branches, даже если одна была недоступна.
 
 ### MSSQL `RESTORE VERIFYONLY`
 
@@ -342,7 +342,7 @@ sequenceDiagram
 RESTORE VERIFYONLY FROM DISK = N'<escaped-absolute-path>';
 ```
 
-Идентификатор файла не параметризуется драйвером внутри `RESTORE`; поэтому путь обязан быть canonical absolute path внутри `watch_path`, NUL запрещён, одинарные кавычки удваиваются. Запрос исполняется с attempt context timeout. SQL Server service account должен иметь read access к source — это проверяет мастер. Любая SQL error/timeout трактуется как невозможность подтвердить целостность: копирование блокируется, ERROR и email обязательны. В health различаются `reachable`, `last_verify_ok` и текст безопасной категории ошибки. Документация подчёркивает, что VERIFYONLY не является тестовым восстановлением.
+Идентификатор файла не параметризуется драйвером внутри `RESTORE`; поэтому путь обязан быть canonical absolute path внутри `watch_path`, NUL запрещён, одинарные кавычки удваиваются. Запрос исполняется с attempt context timeout и отдельным progress timeout (см. Retry, timeout, progress timeout и watchdog ниже). SQL Server service account должен иметь read access к source — это проверяет мастер. Любая SQL error/timeout трактуется как невозможность подтвердить целостность: копирование блокируется, ERROR и email обязательны. MSSQL integrity errors являются permanent (С-13.11) и не допускают повторов, в отличие от временных SQL-ошибок подключения/таймаута. В health различаются `reachable`, `last_verify_ok` и текст безопасной категории ошибки. Документация подчёркивает, что VERIFYONLY не является тестовым восстановлением.
 
 ### SHA-256, SMB и FTP/FTPS
 
@@ -381,11 +381,11 @@ type Runner interface {
 }
 ```
 
-Для attempt `i` (первая имеет `i=1`) задержка перед следующей попыткой равна `min(maximum, initial * multiplier^(i-1))`; jitter не используется, чтобы поведение было воспроизводимо. Retry только для timeout, progress stall, временных сетевых/SQL ошибок и SMB checksum mismatch. Ошибки validation, auth, TLS certificate, path escape и MSSQL integrity result — permanent. Root cancellation прекращает ожидание немедленно.
+Для attempt `i` (первая имеет `i=1`) задержка перед следующей попыткой равна `min(max_interval, initial_interval × multiplier^(i-1))` согласно С-13.6; jitter не используется, чтобы поведение было воспроизводимо. Retry только для timeout, progress stall (`stalled`), временных сетевых ошибок, временных SQL-ошибок (не MSSQL integrity) и SMB checksum mismatch (С-13.10). Ошибки validation, authentication, TLS certificate, path escape и MSSQL integrity result — permanent (С-13.11). Если результат попытки одновременно соответствует временной и постоянной категориям, применяется постоянная (С-13.12). Root cancellation прекращает ожидание немедленно (С-13.9).
 
-У каждой попытки собственный operation deadline. Progress monitor отменяет attempt, если `now-lastProgress > progress_timeout`; для MSSQL `Beat` вызывается при старте, а отсутствие завершения контролируется progress timeout. Stall приводит к cancel, WARN/ERROR по итоговому исчерпанию и email. Освобождение goroutine/handle обязательно до следующей попытки.
+У каждой попытки собственный operation deadline и отдельный progress timeout (С-35). Progress monitor отменяет attempt, если `now-lastProgress > progress_timeout`; для MSSQL `Beat` вызывается при старте, а отсутствие завершения контролируется progress timeout. Stall приводит к cancel, классификации как `stalled`, и retry при наличии неиспользованной попытки (С-13.10). По исчерпанию допустимых попыток (`max_attempts`, включая первую — С-34) для stalled операций пишется ERROR и формируется оповещение (С-31). Освобождение goroutine/handle обязательно до следующей попытки.
 
-Core heartbeat обновляет coordinator при dequeue, завершении этапа и в idle tick. Отдельный watchdog goroutine не участвует в обработке. Если возраст heartbeat строго больше `watchdog_timeout`, он атомарно фиксирует stall один раз, пишет marker, логирует, best-effort отправляет email с коротким deadline и завершает процесс non-zero. SCM recovery action запускает новый процесс; startup читает marker, отправляет уведомление о перезапуске и удаляет marker. `watchdog_timeout` обязан превышать idle heartbeat interval и не подменяет operation timeout.
+Core heartbeat обновляет coordinator при dequeue, завершении этапа и в idle tick (С-32). Отдельный watchdog goroutine не участвует в обработке. Если возраст heartbeat строго больше `watchdog_timeout`, он атомарно фиксирует stall один раз, пишет marker, логирует, best-effort отправляет email с коротким deadline и завершает процесс non-zero (С-32.5–8). SCM recovery action запускает новый процесс; startup читает marker, отправляет уведомление о перезапуске и удаляет marker (С-28). `watchdog_timeout` обязан превышать idle heartbeat interval и не подменяет operation timeout.
 
 ### Ротация
 
